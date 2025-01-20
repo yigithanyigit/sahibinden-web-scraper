@@ -1,44 +1,186 @@
 from typing import Dict, List
-from DrissionPage import ChromiumPage
+from DrissionPage import ChromiumPage, ChromiumOptions
 from CloudflareBypasser import CloudflareBypasser
 from models import ListingData, PropertyDetails, ContactInfo
+from request_manager import RequestProps
 import logging
 import time
 import re
+import random
+import os
+from requests.exceptions import ConnectionError
+
+MAX_RETRIES = 3
 
 class SahibindenScraper:
-    def __init__(self, max_pages: int, delay: int):
-        self.page = ChromiumPage()
+    def __init__(self, max_pages: int, delay: int, headless: bool = False):
+        self.options = ChromiumOptions()
+        self.headless = headless
+        self.logger = logging.getLogger(__name__)
+        self.page_idx = 1
+        self.max_pages = max_pages
+        self.delay = delay
+        self.retry_count = 0
+        self.is_stopped = False
+        self.temp_profile_dir = None  # Initialize here
+        
+        # First get Chrome's actual profile path
+        temp_browser = ChromiumPage()
+        chrome_profile_path = None
+        
+        try:
+            # Get chrome://version data
+            temp_browser.get('chrome://version')
+            profile_element = temp_browser.ele('#profile_path')
+            if profile_element:
+                chrome_profile_path = os.path.dirname(profile_element.text.strip())
+                self.logger.info(f"Found Chrome profile path: {chrome_profile_path}")
+            
+            if not chrome_profile_path:
+                # Try to get from command line as fallback
+                cmd_line = temp_browser.ele('#command_line')
+                if cmd_line:
+                    cmd_text = cmd_line.text
+                    user_data_match = re.search(r'--user-data-dir=(.*?)(?:\s|$)', cmd_text)
+                    if user_data_match:
+                        chrome_profile_path = user_data_match.group(1)
+        except Exception as e:
+            self.logger.warning(f"Could not get Chrome profile path: {e}")
+        finally:
+            temp_browser.quit()
+
+        # Create new profile directory based on original Chrome profile
+        import tempfile
+        import uuid
+        import shutil
+        
+        profile_name = f"scraper_profile_{uuid.uuid4().hex[:8]}"
+        self.temp_profile_dir = os.path.join(tempfile.gettempdir(), profile_name)
+        
+        # Copy default profile if we found Chrome's profile path
+        if chrome_profile_path and os.path.exists(chrome_profile_path):
+            try:
+                default_profile = os.path.join(chrome_profile_path, 'Default')
+                if os.path.exists(default_profile):
+                    self.logger.info("Copying default Chrome profile...")
+                    shutil.copytree(
+                        default_profile,
+                        os.path.join(self.temp_profile_dir, 'Default'),
+                        ignore=shutil.ignore_patterns(
+                            'Cache*', 'Service Worker', '*.log', '*.db',
+                            'Network*', 'Media Cache', '*Storage*'
+                        )
+                    )
+            except Exception as e:
+                self.logger.warning(f"Failed to copy Chrome profile: {e}")
+        
+        # Set Chrome options for the temporary profile
+        self.options.set_argument(f'--user-data-dir={self.temp_profile_dir}')
+        # self.options.set_argument('--profile-directory=Default')
+        self.options.set_argument('--no-first-run')
+        self.options.set_argument('--no-default-browser-check')
+        self.options.set_argument('--disable-features=TranslateUI')
+        self.options.set_argument('--disable-features=ChromeWhatsNewUI')
+        self.options.set_argument('--password-store=basic')
+        self.options.set_argument('--disable-sync')
+        self.options.set_argument('--disable-extensions')
+        
+        if self.headless:
+            print("Running in headless mode")
+            self.__set_headless(headless)
+            
+        self.page = ChromiumPage(self.options)
         self.cf_bypasser = CloudflareBypasser(self.page)
         self.logger = logging.getLogger(__name__)
         self.page_idx = 1
         self.max_pages = max_pages
         self.delay = delay
+        self.retry_count = 0
+
+        self.is_stopped = False
+        # Store temp directory for cleanup
+
+    def __set_headless(self, headless: bool):
+        # Basic settings
+        # Must set these before setting headless mode
+        self.options.set_argument('--blink-settings=imagesEnabled', 'false')
+        
+        self.options.set_argument('--disable-infobars')
+        self.options.set_argument('--disable-extensions')
+        self.options.set_argument('--disable-gpu')
+        self.options.set_argument('--no-sandbox')
+        
+        self.options.headless(headless)
+
+    def __page_loader(self, url: str):
+        if self.is_stopped:
+            return
+
+        if self.headless:
+            self.page.set.window.size(800, 600)
+            # Use RequestProps for user agent and headers
+            self.page.set.user_agent(ua=RequestProps.get_random_user_agent())
+            self.page.set.headers(RequestProps.get_random_headers())
+            return self._get_page(url)
+        else:
+            return self._get_page(url)
 
 
     def _get_page(self, url: str):
-        self.page.get(url)
-        self.cf_bypasser.bypass()
-        while self.page.url_available is False:
-            time.sleep(1)
-        time.sleep(self.delay)
-        if self.page.url != url:
-            self.logger.info(f"Redirected to: {self.page.url}")
-            self.cf_bypasser.bypass()
-            time.sleep(self.delay)
-            self.logger.info(f"Waiting user to proceed, Please type 'y' to continue")
-            inp = input()
-            if inp == 'y':
-                self._get_page(url)
+        """Get page with retry logic"""
+        if self.is_stopped:
+            return False
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                self.page.get(url)
+                retry = 0
+                while self.page.url_available is False and retry < 10:
+                    time.sleep(1)
+                    retry += 1
+                
+                if not self.page.url_available:
+                    raise ConnectionError("Page not available after timeout")
+
+                self.cf_bypasser.bypass()
+                
+                if self.page.url != url:
+                    self.logger.info(f"Redirected to: {self.page.url}")
+                    self.cf_bypasser.bypass()
+                    time.sleep(self.delay)
+                    if not self.headless:  # Only ask for input in non-headless mode
+                        self.logger.info("Waiting user to proceed, Please type 'y' to continue")
+                        inp = input()
+                        if inp == 'y':
+                            return self._get_page(url)
+                return True
+
+            except Exception as e:
+                self.logger.error(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {str(e)}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(self.delay * 2)  # Increase delay between retries
+                    try:
+                        # Try to refresh the page connection
+                        self.page.refresh()
+                    except:
+                        pass
+                else:
+                    self.logger.error("Max retries reached, giving up")
+                    return False
+        return False
 
     def scrape_listing_page(self, url: str) -> List[ListingData]:
-        self._get_page(url)
+        if self.is_stopped:
+            return []
+            
+        if not self.__page_loader(url):
+            self.logger.error("Failed to load page")
+            return []
+            
         listings = []
         
         # First get the table
         table = self.page.ele('@id=searchResultsTable')
-        self.logger.debug(f"Found table: {table is not None}")
-        
         if not table:
             self.logger.error("Table not found")
             return listings
@@ -76,8 +218,8 @@ class SahibindenScraper:
                     size_m2=float(item.eles('@class=searchResultsAttributeValue')[0].text.replace('m²', '').strip()),
                     room_count=item.eles('@class=searchResultsAttributeValue')[1].text.strip(),
                     price=item.ele('@class=searchResultsPriceValue').text.strip(),
-                    date=item.ele('@class=searchResultsDateValue true').text.replace('\n', ' ').strip(),
-                    location=item.ele('@class=searchResultsLocationValue true ').text.replace('\n', ' ').strip(),
+                    date=item.ele('@class:searchResultsDateValue').text.replace('\n', ' ').strip(),
+                    location=item.ele('@class:searchResultsLocationValue').text.replace('\n', ' ').strip(),
                     image_url=item.ele('@tag()=img').attr('src'),
                     #detail_url='https://www.sahibinden.com' + title_element.attr('href')
                     detail_url=title_element.attr('href')
@@ -109,8 +251,13 @@ class SahibindenScraper:
             return ''
 
     def scrape_detail_page(self, url: str) -> tuple[PropertyDetails, ContactInfo]:
-        self._get_page(url)
-        
+        if self.is_stopped:
+            return None, None
+            
+        if not self.__page_loader(url):
+            self.logger.error("Failed to load detail page")
+            return None, None
+            
         # Extract property details
         details = {}
         detail_ul = self.page.ele('@class:classifiedInfoList')
@@ -160,16 +307,24 @@ class SahibindenScraper:
         """Extract contact info handling both company and individual sellers"""
         
         # Check if it's a company listing (has store info)
-        store_name = self.page.ele('@class:user-info-store-name')
+
+        store_info = self.page.ele('@class=classifiedOtherBoxes ').ele('@class=user-info-module')
         
-        if store_name:
+        if store_info:
             # Company listing
 
+            store_name = self.page.ele('@class=user-info-store-name')
+            print(store_name)
             agency_name = store_name.text.strip()
-            agent_name_div = self.page.ele('@class:user-info-agent')
+            print(agency_name)
+            agent_name_div = self.page.ele('@class=user-info-agent')
+            print(agent_name_div)
             agent_name = self._safe_extract(agent_name_div, 'tag:h3', 'text')
-            office_phone = self._get_phone_number('İş')
-            mobile_phone = self._get_phone_number('Cep')
+            print(agent_name)
+            office_phone = self._get_phone_number("İş", store_info)
+            print(office_phone)
+            mobile_phone = self._get_phone_number("Cep", store_info)
+            print(mobile_phone)
 
 
             return ContactInfo(
@@ -203,13 +358,14 @@ class SahibindenScraper:
                 mobile_phone=self._get_individual_phone()
             )
 
-    def _get_phone_number(self, phone_type: str) -> str:
+    def _get_phone_number(self, phone_type: str, parent=None) -> str:
         """Get phone number by type"""
         try:
-            phones = self.page.eles('@class:dl-group')
-            for phone in phones:
-                if phone_type in phone.parent().text:
-                    return phone.text.strip()
+            phones = parent.eles('@class:dl-group') if parent else self.page.eles('@class:dl-group')
+            for phone_field in phones:
+                phone_name = phone_field.ele(f'tag:dt@@text()={phone_type}')
+                if phone_name:
+                    return phone_field.ele(f'tag:dd').text.strip()
             return ''
         except Exception as e:
             self.logger.error(f"Error getting {phone_type} phone: {e}")
@@ -258,7 +414,6 @@ class SahibindenScraper:
         if url:
             self._get_page(url)
 
-
         page_nav = self.page.ele('tag:ul@@class:pageNaviButtons')
         if not page_nav:
             self.logger.info("No page nav found")
@@ -273,3 +428,28 @@ class SahibindenScraper:
             return link
         return ''
     
+
+    def close(self):
+        """Safely close browser and cleanup temp profile"""
+        self.is_stopped = True
+        try:
+            if hasattr(self, 'page') and self.page:
+                try:
+                    self.page.refresh()
+                except:
+                    pass
+                time.sleep(1)
+                self.page.quit()
+                
+            # Cleanup temporary profile directory
+            if hasattr(self, 'temp_profile_dir') and os.path.exists(self.temp_profile_dir):
+                import shutil
+                try:
+                    shutil.rmtree(self.temp_profile_dir)
+                except Exception as e:
+                    self.logger.warning(f"Failed to cleanup temp profile: {e}")
+        except:
+            pass
+        finally:
+            self.page = None
+        self.logger.info("Browser closed and profile cleaned up")

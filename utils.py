@@ -10,8 +10,14 @@ def isPageChanged(chromiumPage, url, function):
             self.logger.info(f"Redirected to: {self.page.url}")
             self.cf_bypasser.bypass()
             time.sleep(self.delay)
-            self.logger.info(f"Waiting user to proceed, Please type 'y' to continue")
-            inp = input()
-            if inp == 'y':
-                return function(self, *args, **kwargs)
+            
+            # Modified to support both CLI and UI
+            if hasattr(self, 'ui_mode') and self.ui_mode:
+                return False
+            else:
+                self.logger.info(f"Waiting user to proceed, Please type 'y' to continue")
+                inp = input()
+                if inp == 'y':
+                    return function(self, *args, **kwargs)
+        return function(self, *args, **kwargs)
     return wrapper

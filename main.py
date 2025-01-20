@@ -1,68 +1,48 @@
 import logging
-from scraper import SahibindenScraper
-from messager import SahibindenMessager
-import json
-from dataclasses import asdict
-import argparse
+from state_manager import StateManager
+from controllers.cli_controller import CLIScrapeController
+from arg_parser import create_argument_parser, get_scraper_args, handle_export_args
 
 def setup_logging():
     logging.basicConfig(
-        level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
+        level=logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
 def main():
-    args = argparse.ArgumentParser()
-    args.add_argument("--url", help="URL to scrape")
-    args.add_argument("--max_pages", type=int, help="Maximum number of pages to scrape", default=1)
-    args.add_argument("--delay", type=int, help="Delay between requests in seconds", default=1.5)
-    args = args.parse_args()
-
+    parser = create_argument_parser()
+    args = parser.parse_args()
     setup_logging()
     logger = logging.getLogger(__name__)
-    
-    url = args.url
-    scraper = SahibindenScraper(args.max_pages, args.delay)
-    messager = SahibindenMessager("Merhaba, ilanınız hala satılık mı?")
-    
-    try:
-        """
-        listings = scraper.scrape_listing_page(url)
-        url = "https://www.sahibinden.com/ilan/emlak-konut-satilik-arslan-dan-gaziemir-irmak-mah-onu-acik-3-plus1-satilik-daire-1221529389/detay"
-        messager.send_message(url)
-        exit()
-        """
 
-        while url != '':
-            logger.info(f"Starting to scrape URL: {url}")
-            listings = scraper.scrape_listing_page(url)
-            
-            logger.info(f"Found {len(listings)} listings to process")
-            
-            # Scrape details for each listing
-            full_data = []
-            for listing in listings:
-                try:
-                    property_details, contact_info = scraper.scrape_detail_page(listing.detail_url)
-                    full_data.append({
-                        "listing": asdict(listing),
-                        "property_details": asdict(property_details),
-                        "contact_info": asdict(contact_info)
-                    })
-                except Exception as e:
-                    logger.error(f"Error processing detail page {listing.detail_url}: {e}")
-                    continue
-                    
-            url = scraper.next_page(url)
+    # Handle utility arguments
+    if handle_export_args(args):
+        return
 
-        # Save results
-        with open('scraping_results.json', 'w', encoding='utf-8') as f:
-            json.dump(full_data, f, ensure_ascii=False, indent=2)
+    # Initialize state manager
+    state_manager = StateManager(args.state if args.state else "scraper_state.json")
+    
+    # Handle resume logic
+    if args.resume:
+        if not state_manager.state:
+            logger.error("No state file found to resume from")
+            return
             
-        logger.info(f"Successfully scraped {len(full_data)} listings")
+        saved_args = state_manager.get_scraper_args()
+        scraper_args = {k: getattr(args, k) if getattr(args, k) != v else v 
+                       for k, v in saved_args.items()}
+        args.url = state_manager.state.url
         
-    except Exception as e:
-        logger.error(f"Error during scraping: {e}")
+    elif args.url:
+        scraper_args = get_scraper_args(args)
+        state_manager.initialize_state(args.url, **scraper_args)
+    else:
+        logger.error("Either --url or --resume must be specified")
+        return
+
+    # Start scraping
+    controller = CLIScrapeController(state_manager)
+    controller.start_scraping(args.url, scraper_args)
 
 if __name__ == "__main__":
     main()
